@@ -57,6 +57,11 @@ static const char *TAG = "L2";
 #include "fault_demo.h"
 #include "dual_core_demo.h"
 #include "net_client.h"
+#include "camera_demo.h"
+#include "display_demo.h"
+#include "lvgl_demo.h"
+#include "camera_preview.h"
+#include "camera_ui.h"
 
 /*============================================================================
  * 实验选择器 —— 改这一行就能切换要跑的实验（0~12）
@@ -75,8 +80,13 @@ static const char *TAG = "L2";
 #define EXP_FAULT           10  /* D3：四类故障（fault_demo.c） */
 #define EXP_DUAL_CORE       11  /* 双芯第二课：双核任务与核间通信 */
 #define EXP_NET_CLIENT      12  /* P6：lwIP socket 客户端 + 错误码 + 退避重连 */
+#define EXP_CAMERA          13  /* P5：SC2336 + MIPI-CSI 采集 */
+#define EXP_DISPLAY         14  /* P4：JD9165 1024x600 点屏（彩条） */
+#define EXP_LVGL            15  /* P4：LVGL 界面 + GT911 触摸 */
+#define EXP_CAM_PREVIEW     16  /* P5：SC2336 → JD9165 预览 */
+#define EXP_CAM_UI          17  /* P5：LVGL 叠在相机预览上 */
 
-#define RUN_EXPERIMENT      EXP_NET_CLIENT
+#define RUN_EXPERIMENT      EXP_CAM_UI
 /*============================================================================
  * 每个任务自己的配置：靠 xTaskCreate 的参数传进去，而不是全局变量
  *============================================================================*/
@@ -229,6 +239,11 @@ void app_main(void)
     case EXP_DUAL_CORE:      dual_core_demo_start();     return;
     case EXP_NET_CLIENT:     net_client_start(NET_CLIENT_DEFAULT_HOST,
                                               NET_CLIENT_DEFAULT_PORT); return;
+    case EXP_CAMERA:         camera_demo_start();         return;
+    case EXP_DISPLAY:        display_demo_start();        return;
+    case EXP_LVGL:           lvgl_demo_start();           return;
+    case EXP_CAM_PREVIEW:    camera_preview_start();      return;
+    case EXP_CAM_UI:         camera_ui_start();           return;
     case EXP_L2_TASKS:
     default:                 break;   /* 继续执行下面的 L2 代码 */
     }
