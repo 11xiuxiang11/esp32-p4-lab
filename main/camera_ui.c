@@ -1,16 +1,16 @@
 /*
- * camera_ui.c —— LVGL 界面叠在相机预览上（EXP_CAM_UI = 17）
+ * camera_ui.c —— 相机直绘 + LVGL 小区域叠加（EXP_CAM_UI = 17）
  *
- * 数据流：
- *   SC2336 → CSI → ISP → RGB565 1024x600 → /dev/video0
- *   → memcpy 到 LVGL canvas 缓冲 → LVGL 合成 UI → 整屏 flush → JD9165
+ * 优化点：
+ *   之前把整帧 canvas 交给 LVGL 合成，LVGL 软件重绘 1024x600 要 76ms，只有 12fps。
+ *   现在相机帧直接 draw_bitmap 到面板（y=64..600），LVGL 只负责顶部状态条和
+ *   右下角按钮这些小区域，用 PARTIAL 模式 + 256KB 小缓冲，不再合成整屏。
  *
- * 共享：
- *   I2C1（SCL=GPIO8, SDA=GPIO7）同时给相机 SCCB（0x30）和 GT911（0x14）。
- *   只创建一条 i2c_master_bus，两个驱动共用。
+ * 同步：
+ *   面板的 DMA2D 是共享资源，相机绘制和 LVGL flush 都用 s_panel_mutex 串行。
+ *   相机每画一帧会盖掉右下角按钮，所以画完 invalidate 按钮，让 LVGL 补画。
  *
- * 显示：自建 lv_display（整屏 PSRAM 缓冲 + draw_bitmap + flush_ready），
- *       不用 esp_lvgl_port 的 DSI 适配（IDF 5.5 的 IRAM 回调限制）。
+ * 共享 I2C1：相机 SCCB（0x30）+ GT911（0x14），只建一条总线。
  */
 
 #include <fcntl.h>
@@ -22,6 +22,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_heap_caps.h"
@@ -47,21 +48,30 @@ static const char *TAG = "CAMUI";
 #define PREVIEW_W       DISPLAY_H_RES
 #define PREVIEW_H       DISPLAY_V_RES
 #define PREVIEW_BYTES   (PREVIEW_W * PREVIEW_H * 2)
-#define CAM_BUF_COUNT   2
+#define CAM_BUF_COUNT   3
+#define TOP_BAR_H       64
+#define UI_BUF_LINES    128
 
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_touch_handle_t s_tp;
-static lv_obj_t *s_canvas;
+static lv_obj_t *s_bar;
+static lv_obj_t *s_btn;
 static lv_obj_t *s_fps_label;
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_freeze_label;
-static uint8_t *s_canvas_buf;
+static SemaphoreHandle_t s_panel_mutex;
 static volatile bool s_paused;
 
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+    if (s_panel_mutex) {
+        xSemaphoreTake(s_panel_mutex, portMAX_DELAY);
+    }
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px_map);
+    if (s_panel_mutex) {
+        xSemaphoreGive(s_panel_mutex);
+    }
     lv_display_flush_ready(disp);
 }
 
@@ -140,7 +150,6 @@ static void camera_stream_task(void *arg)
     }
 
     uint8_t *buffers[CAM_BUF_COUNT] = {0};
-    size_t lengths[CAM_BUF_COUNT] = {0};
     for (int i = 0; i < CAM_BUF_COUNT; i++) {
         struct v4l2_buffer buf = {
             .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
@@ -160,7 +169,6 @@ static void camera_stream_task(void *arg)
             vTaskDelete(NULL);
             return;
         }
-        lengths[i] = buf.length;
         ioctl(fd, VIDIOC_QBUF, &buf);
     }
 
@@ -187,18 +195,30 @@ static void camera_stream_task(void *arg)
         }
 
         if (!s_paused && buffers[buf.index] != NULL) {
-            size_t n = lengths[buf.index] < PREVIEW_BYTES ? lengths[buf.index] : PREVIEW_BYTES;
-            lvgl_port_lock(0);
-            memcpy(s_canvas_buf, buffers[buf.index], n);
-            lv_obj_invalidate(s_canvas);
+            int64_t t_draw0 = esp_timer_get_time();
+
+            /* 相机直绘：跳过顶部 64 行（留给 UI），其余整宽送屏 */
+            if (s_panel_mutex) {
+                xSemaphoreTake(s_panel_mutex, portMAX_DELAY);
+            }
+            esp_lcd_panel_draw_bitmap(s_panel, 0, TOP_BAR_H, PREVIEW_W, PREVIEW_H,
+                                      buffers[buf.index] + TOP_BAR_H * PREVIEW_W * 2);
+            if (s_panel_mutex) {
+                xSemaphoreGive(s_panel_mutex);
+            }
+
             frames++;
             if ((frames % 30) == 0 && s_fps_label) {
                 int64_t t1 = esp_timer_get_time();
                 int fps = (int)(30.0f * 1000000.0f / (float)(t1 - t0));
+                lvgl_port_lock(0);
                 lv_label_set_text_fmt(s_fps_label, "%d fps", fps);
+                lv_obj_invalidate(s_bar);
+                lvgl_port_unlock();
                 t0 = t1;
+                ESP_LOGI(TAG, "显示 %d fps, draw=%lldus", fps,
+                         (long long)(esp_timer_get_time() - t_draw0));
             }
-            lvgl_port_unlock();
         }
 
         ioctl(fd, VIDIOC_QBUF, &buf);
@@ -212,6 +232,8 @@ static void camera_stream_task(void *arg)
 static void camera_ui_task(void *arg)
 {
     (void)arg;
+
+    s_panel_mutex = xSemaphoreCreateMutex();
 
     esp_lcd_panel_io_handle_t io;
     ESP_ERROR_CHECK(display_port_init(&s_panel, &io));
@@ -242,7 +264,6 @@ static void camera_ui_task(void *arg)
     ESP_ERROR_CHECK(esp_video_init(&video_cfg));
     ESP_LOGI(TAG, "相机初始化完成");
 
-    /* GT911（模块在 0x14） */
     uint8_t tp_addr = 0;
     if (i2c_master_probe(i2c_bus, 0x5D, 50) == ESP_OK) {
         tp_addr = 0x5D;
@@ -280,16 +301,16 @@ static void camera_ui_task(void *arg)
     lv_display_t *disp = lv_display_create(PREVIEW_W, PREVIEW_H);
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
 
-    const size_t fb_bytes = PREVIEW_W * PREVIEW_H * 2;
-    void *draw_buf = heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_canvas_buf = heap_caps_malloc(PREVIEW_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (draw_buf == NULL || s_canvas_buf == NULL) {
-        ESP_LOGE(TAG, "PSRAM 缓冲分配失败");
+    /* PARTIAL + 小缓冲：只装得下顶部条/按钮，不装整屏 */
+    const size_t ui_buf_bytes = PREVIEW_W * UI_BUF_LINES * 2;
+    void *ui_buf = heap_caps_malloc(ui_buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ui_buf == NULL) {
+        ESP_LOGE(TAG, "PSRAM 分配 UI 缓冲失败");
         lvgl_port_unlock();
         vTaskDelete(NULL);
         return;
     }
-    lv_display_set_buffers(disp, draw_buf, NULL, fb_bytes, LV_DISPLAY_RENDER_MODE_FULL);
+    lv_display_set_buffers(disp, ui_buf, NULL, ui_buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp, flush_cb);
 
     lv_theme_t *theme = lv_theme_default_init(disp,
@@ -306,41 +327,37 @@ static void camera_ui_task(void *arg)
     }
 
     lv_obj_t *scr = lv_screen_active();
-    memset(s_canvas_buf, 0, PREVIEW_BYTES);
-    s_canvas = lv_canvas_create(scr);
-    lv_canvas_set_buffer(s_canvas, s_canvas_buf, PREVIEW_W, PREVIEW_H, LV_COLOR_FORMAT_RGB565);
-    lv_obj_set_pos(s_canvas, 0, 0);
-    lv_obj_set_size(s_canvas, PREVIEW_W, PREVIEW_H);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    /* 顶部状态条（半透明黑） */
-    lv_obj_t *bar = lv_obj_create(scr);
-    lv_obj_set_size(bar, PREVIEW_W, 64);
-    lv_obj_set_pos(bar, 0, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_60, 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
+    s_bar = lv_obj_create(scr);
+    lv_obj_set_size(s_bar, PREVIEW_W, TOP_BAR_H);
+    lv_obj_set_pos(s_bar, 0, 0);
+    lv_obj_set_style_bg_color(s_bar, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_bar, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(s_bar, 0, 0);
 
-    lv_obj_t *title = lv_label_create(bar);
+    lv_obj_t *title = lv_label_create(s_bar);
     lv_label_set_text(title, "SC2336 1024x600");
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 20, 0);
 
-    s_status_label = lv_label_create(bar);
+    s_status_label = lv_label_create(s_bar);
     lv_label_set_text(s_status_label, "预览中");
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x8FD3FF), 0);
     lv_obj_align(s_status_label, LV_ALIGN_CENTER, 0, 0);
 
-    s_fps_label = lv_label_create(bar);
+    s_fps_label = lv_label_create(s_bar);
     lv_label_set_text(s_fps_label, "-- fps");
     lv_obj_set_style_text_color(s_fps_label, lv_color_white(), 0);
-    lv_obj_align(s_fps_label, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_obj_align(s_fps_label, LV_ALIGN_RIGHT_MID, -170, 0);
 
-    /* 冻结/继续按钮 */
-    lv_obj_t *btn = lv_button_create(scr);
-    lv_obj_set_size(btn, 180, 64);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_RIGHT, -30, -30);
-    lv_obj_add_event_cb(btn, freeze_clicked_cb, LV_EVENT_CLICKED, NULL);
-    s_freeze_label = lv_label_create(btn);
+    /* 按钮放进顶栏：相机不画 y<64，按钮不会被盖掉，不会闪 */
+    s_btn = lv_button_create(s_bar);
+    lv_obj_set_size(s_btn, 140, 48);
+    lv_obj_align(s_btn, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_add_event_cb(s_btn, freeze_clicked_cb, LV_EVENT_CLICKED, NULL);
+    s_freeze_label = lv_label_create(s_btn);
     lv_label_set_text(s_freeze_label, "冻结");
     lv_obj_center(s_freeze_label);
 
