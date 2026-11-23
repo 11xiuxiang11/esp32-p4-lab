@@ -12,6 +12,7 @@
  *   重拨的节奏（退避、等多久）在 net_client.c 的任务里。
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -30,7 +31,6 @@ static const char *TAG = "WIFI";
 
 static EventGroupHandle_t s_events = NULL;
 #define WIFI_GOT_IP_BIT       BIT0
-#define WIFI_DISCONNECTED_BIT BIT1
 #define WIFI_DISCONNECTED_BIT BIT1
 /* Wi-Fi / IP 事件：只记录状态，不阻塞、不循环 */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -188,4 +188,27 @@ void wifi_sta_kick(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect: 0x%x", ret);
     }
+}
+
+bool wifi_sta_get_ip_str(char *out, size_t out_len)
+{
+    /* 句柄来自 esp_netif_create_default_wifi_sta()，接口键固定是 WIFI_STA_DEF */
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == NULL) {
+        return false;
+    }
+
+    esp_netif_ip_info_t info = {0};
+    if (esp_netif_get_ip_info(netif, &info) != ESP_OK) {
+        return false;
+    }
+    if (info.ip.addr == 0) {
+        return false;   /* 还没 DHCP 到地址 */
+    }
+
+    if (out == NULL || out_len == 0) {
+        return false;
+    }
+    snprintf(out, out_len, IPSTR, IP2STR(&info.ip));
+    return true;
 }

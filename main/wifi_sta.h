@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -26,3 +27,7 @@ bool wifi_sta_wait_ip(uint32_t timeout_ms);
 /* 让驱动重新发起一次连接（非阻塞，只发命令）。
  * 什么时候用：等 IP 超时后，由上层决定等多久再拨。 */
 void wifi_sta_kick(void);
+
+/* 把当前 IPv4 地址写成字符串（"192.168.1.23"），方便打印访问地址。
+ * 返回 true = 有地址且写进了 out；false = 还没拿到 IP（或 netif 没建）。 */
+bool wifi_sta_get_ip_str(char *out, size_t out_len);

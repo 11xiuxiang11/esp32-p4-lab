@@ -62,9 +62,10 @@ static const char *TAG = "L2";
 #include "lvgl_demo.h"
 #include "camera_preview.h"
 #include "camera_ui.h"
+#include "mjpeg_server.h"
 
 /*============================================================================
- * 实验选择器 —— 改这一行就能切换要跑的实验（0~12）
+ * 实验选择器 —— 改这一行就能切换要跑的实验（0~18）
  * 切换后重新 build + flash 即可；调试器里按 F5 就是调试这个实验。
  *============================================================================*/
 #define EXP_L2_TASKS        0   /* L2：两个周期任务 + 运行时间统计（默认） */
@@ -85,8 +86,9 @@ static const char *TAG = "L2";
 #define EXP_LVGL            15  /* P4：LVGL 界面 + GT911 触摸 */
 #define EXP_CAM_PREVIEW     16  /* P5：SC2336 → JD9165 预览 */
 #define EXP_CAM_UI          17  /* P5：LVGL 叠在相机预览上 */
+#define EXP_MJPEG           18  /* P5：Wi-Fi 图传（HTTP /jpg 单帧） */
 
-#define RUN_EXPERIMENT      EXP_CAM_UI
+#define RUN_EXPERIMENT      EXP_MJPEG
 /*============================================================================
  * 每个任务自己的配置：靠 xTaskCreate 的参数传进去，而不是全局变量
  *============================================================================*/
@@ -244,6 +246,7 @@ void app_main(void)
     case EXP_LVGL:           lvgl_demo_start();           return;
     case EXP_CAM_PREVIEW:    camera_preview_start();      return;
     case EXP_CAM_UI:         camera_ui_start();           return;
+    case EXP_MJPEG:          mjpeg_server_start();         return;
     case EXP_L2_TASKS:
     default:                 break;   /* 继续执行下面的 L2 代码 */
     }
